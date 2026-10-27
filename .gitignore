@@ -1,0 +1,8 @@
+.venv/
+__pycache__/
+models/
+config.json
+headfocus.log
+*.plist.generated
+.DS_Store
+.build/

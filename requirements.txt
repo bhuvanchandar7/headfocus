@@ -1,0 +1,6 @@
+mediapipe>=0.10.14
+opencv-python>=4.8
+numpy>=1.24
+pyobjc-framework-Quartz>=10.0
+pyobjc-framework-ApplicationServices>=10.0
+pyobjc-framework-Cocoa>=10.0

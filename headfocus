@@ -1,0 +1,54 @@
+#!/bin/zsh
+# headfocus calibrate | run [--preview] | displays | focus N   -> the tracker
+# headfocus install | uninstall | start | stop | restart | status | log
+DIR="${0:A:h}"
+LABEL=io.github.headfocus
+APP="$HOME/Applications/HeadFocus.app"
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+DOMAIN="gui/$(id -u)"
+loaded() { launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1 }
+
+[[ -x "$DIR/.venv/bin/python" ]] || [[ "$1" == uninstall ]] || { echo "Run ./setup.sh first."; exit 1; }
+
+case "$1" in
+  install)
+    [[ -f "$DIR/config.json" ]] || { echo "Calibrate first: ./headfocus calibrate"; exit 1; }
+    [[ -x "$APP/Contents/MacOS/HeadFocus" ]] || { echo "HeadFocus.app missing. Run ./setup.sh"; exit 1; }
+    # Remove agents left by older versions under a different name.
+    for old in "$HOME"/Library/LaunchAgents/*headfocus*.plist(N); do
+      [[ "$old" == "$PLIST" ]] && continue
+      launchctl bootout "$DOMAIN" "$old" 2>/dev/null; rm -f "$old"
+    done
+    mkdir -p "$HOME/Library/LaunchAgents"
+    cat > "$PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>$LABEL</string>
+  <key>ProgramArguments</key><array><string>$APP/Contents/MacOS/HeadFocus</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+  <key>ThrottleInterval</key><integer>30</integer>
+  <key>ProcessType</key><string>Interactive</string>
+  <key>StandardOutPath</key><string>$DIR/headfocus.log</string>
+  <key>StandardErrorPath</key><string>$DIR/headfocus.log</string>
+</dict></plist>
+EOF
+    loaded && launchctl bootout "$DOMAIN/$LABEL"
+    launchctl bootstrap "$DOMAIN" "$PLIST"
+    echo "Installed. HeadFocus runs in the background and starts at every login."
+    echo "When macOS asks, allow Camera and Accessibility for HeadFocus (it retries every 30s)."
+    open "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility" ;;
+  uninstall)
+    loaded && launchctl bootout "$DOMAIN/$LABEL"
+    rm -f "$PLIST"; echo "Uninstalled. (HeadFocus.app is in ~/Applications if you want to delete it.)" ;;
+  start)   loaded || launchctl bootstrap "$DOMAIN" "$PLIST"; launchctl kickstart "$DOMAIN/$LABEL"; echo "Running." ;;
+  stop)    loaded && launchctl bootout "$DOMAIN/$LABEL"; echo "Stopped until next login (or: ./headfocus start)." ;;
+  restart) launchctl kickstart -k "$DOMAIN/$LABEL" ;;
+  status)  if loaded; then launchctl print "$DOMAIN/$LABEL" | grep -E "state =|pid =|last exit" | head -3; else echo "not running"; fi ;;
+  log)     tail -n 30 -f "$DIR/headfocus.log" ;;
+  calibrate)
+    "$DIR/.venv/bin/python" "$DIR/headfocus.py" "$@" || exit
+    loaded && launchctl kickstart -k "$DOMAIN/$LABEL" && echo "Restarted the background copy with the new calibration." ;;
+  *)       exec "$DIR/.venv/bin/python" "$DIR/headfocus.py" "$@" ;;
+esac
