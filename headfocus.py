@@ -8,6 +8,7 @@ the active window, so you can type into it right away.
 Commands:
   calibrate          look at each display when asked; saves config.json
   run [--preview]    start tracking (Ctrl+C to stop)
+  on / off / toggle  turn tracking on or off (off releases the camera)
   displays           list displays and the top window on each
   focus N            focus the top window on display N (no camera, for testing)
 """
@@ -325,9 +326,252 @@ def cmd_calibrate(args):
                       f"{dist:.1f} degrees apart. Turn your head more during calibration, "
                       "or switching between them may be unreliable.")
 
+    cfg = json.load(open(CONFIG)) if os.path.exists(CONFIG) else {}
+    cfg.update({"camera": args.camera, "displays": centers})
     with open(CONFIG, "w") as f:
-        json.dump({"camera": args.camera, "displays": centers}, f, indent=2)
+        json.dump(cfg, f, indent=2)
     print(f"\nSaved {CONFIG}. Try it with: ./headfocus run --preview")
+
+
+OFF_FLAG = os.path.join(HERE, ".off")   # exists = turned off
+HOTKEY = "ctrl+opt+cmd+h"
+
+
+def is_on():
+    return not os.path.exists(OFF_FLAG)
+
+
+def set_on(on):
+    if on:
+        if os.path.exists(OFF_FLAG):
+            os.remove(OFF_FLAG)
+    else:
+        open(OFF_FLAG, "w").close()
+
+
+def load_centers(cfg, displays):
+    """Match calibrated displays by ID, falling back to name (macOS can give a
+    monitor a new ID after it sleeps or is reconnected)."""
+    by_id = {d["id"]: i for i, d in enumerate(displays)}
+    by_name = {d["name"]: i for i, d in enumerate(displays)}
+    centers = []
+    for c in cfg["displays"]:
+        i = by_id.get(c["id"], by_name.get(c["name"]))
+        if i is not None and i not in [x[0] for x in centers]:
+            centers.append((i, np.array([c["yaw"], c["pitch"]]), c["name"]))
+    return centers
+
+
+class Tracker:
+    """Camera loop that decides which display you face. Can be turned on/off;
+    when off, the camera is released (webcam light goes off)."""
+
+    def __init__(self, args, cfg, displays, centers, on_change=None):
+        self.args, self.displays, self.centers = args, displays, centers
+        self.camera = cfg.get("camera", args.camera)
+        self.dwell = cfg.get("dwell", args.dwell)
+        self.margin = cfg.get("margin", args.margin)
+        self.max_dist = cfg.get("max_dist", 22.0)  # farther than this from every display = looking away
+        self.debug = cfg.get("debug", False)
+        self.on_change = on_change or (lambda: None)
+        self.pose = None
+        self.enabled = None
+        self.current = None
+        self.stop = False
+
+    def name(self, idx):
+        return next((n for i, _, n in self.centers if i == idx), "?")
+
+    def _reset(self):
+        self.smoothed = None
+        self.current = None        # display we last decided you're looking at
+        self.candidate, self.since = None, 0.0
+
+    def run(self):
+        alpha = 0.5                # smoothing (higher = more responsive)
+        period = 1.0 / self.args.fps
+        layout = [d["id"] for d in self.displays]
+        next_layout_check = next_flag_check = next_trace = 0.0
+        self._reset()
+        names = ", ".join(f"[{i}] {n}" for i, _, n in self.centers)
+        log(f"Tracking {names}. dwell {self.dwell:.2f}s, margin {self.margin:.1f} deg.")
+        try:
+            while not self.stop:
+                t = time.monotonic()
+                if t >= next_layout_check:
+                    next_layout_check = t + 5
+                    if [d["id"] for d in get_displays()] != layout:
+                        # Monitor plugged/unplugged: exit so the login agent restarts
+                        # us with the new layout.
+                        log("Display layout changed, restarting.")
+                        os._exit(3)
+                if t >= next_flag_check:
+                    next_flag_check = t + 0.3
+                    on = is_on()
+                    if on != self.enabled:
+                        self.enabled = on
+                        if on:
+                            log("Turned on.")
+                            self.pose = HeadPose(self.camera, preview=self.args.preview)
+                        else:
+                            log("Turned off.")
+                            if self.pose:
+                                self.pose.close()
+                            self.pose = None
+                        self._reset()  # don't steal focus right after turning on
+                        self.on_change()
+                if not self.enabled:
+                    time.sleep(0.2)
+                    continue
+
+                p = self.pose.read(label=self.name(self.current)
+                                   if self.current is not None else "")
+                if self.debug and t >= next_trace:
+                    next_trace = t + 0.5
+                    sm = self.smoothed
+                    log("pose " + (f"yaw {p[0]:+6.1f} pitch {p[1]:+6.1f}" if p else "no face")
+                        + (f"  smoothed {sm[0]:+6.1f} {sm[1]:+6.1f}" if sm is not None else "")
+                        + f"  current {self.current}")
+                if p is None:
+                    self.candidate = None
+                else:
+                    v = np.array(p)
+                    self.smoothed = v if self.smoothed is None else alpha * v + (1 - alpha) * self.smoothed
+                    self._decide(t)
+
+                dt = time.monotonic() - t
+                if dt < period:
+                    time.sleep(period - dt)
+        finally:
+            if self.pose:
+                self.pose.close()
+
+    def _decide(self, t):
+        sm = self.smoothed
+        dists = {i: float(np.linalg.norm(sm - c)) for i, c, _ in self.centers}
+        nearest = min(dists, key=dists.get)
+        cur = self.current
+        # Looking away (phone, window, person): don't switch.
+        if dists[nearest] > self.max_dist:
+            self.candidate = None
+        # Hysteresis: only consider a switch when clearly closer to another display.
+        elif cur is None or (nearest != cur and dists[cur] - dists[nearest] > self.margin):
+            if self.candidate != nearest:
+                self.candidate, self.since = nearest, t
+            elif t - self.since >= self.dwell:
+                first = cur is None
+                self.current, self.candidate = nearest, None
+                log(f"facing [{nearest}] yaw {sm[0]:+.1f} pitch {sm[1]:+.1f}"
+                    + (" (startup, no focus change)" if first else ""))
+                if not first:  # don't steal focus at startup / right after turning on
+                    on_switch(self.displays, nearest, self.args)
+                self.on_change()
+        else:
+            self.candidate = None
+
+
+def parse_hotkey(spec):
+    from AppKit import (NSEventModifierFlagCommand, NSEventModifierFlagControl,
+                        NSEventModifierFlagOption, NSEventModifierFlagShift)
+    flags = {"cmd": NSEventModifierFlagCommand, "ctrl": NSEventModifierFlagControl,
+             "opt": NSEventModifierFlagOption, "alt": NSEventModifierFlagOption,
+             "shift": NSEventModifierFlagShift}
+    *mods, key = spec.lower().split("+")
+    mask = 0
+    for m in mods:
+        mask |= flags[m]
+    return mask, key
+
+
+def hotkey_label(spec):
+    sym = {"ctrl": "⌃", "opt": "⌥", "alt": "⌥", "shift": "⇧", "cmd": "⌘"}
+    *mods, key = spec.lower().split("+")
+    return "".join(sym[m] for m in mods) + key.upper()
+
+
+def run_menubar(tracker, hotkey):
+    """Menu bar icon (eye / eye with slash) + global hotkey to turn on/off."""
+    import objc
+    from AppKit import (NSApplication, NSApplicationActivationPolicyAccessory, NSEvent,
+                        NSEventMaskKeyDown, NSEventModifierFlagDeviceIndependentFlagsMask,
+                        NSImage, NSMenu, NSMenuItem, NSSound, NSStatusBar,
+                        NSVariableStatusItemLength, NSWorkspace)
+    from Foundation import NSObject, NSURL
+    from PyObjCTools import AppHelper
+
+    mask, key = parse_hotkey(hotkey)
+
+    class Controller(NSObject):
+        def setup(self):
+            bar = NSStatusBar.systemStatusBar()
+            self.item = bar.statusItemWithLength_(NSVariableStatusItemLength)
+            menu = NSMenu.alloc().init()
+            self.status = menu.addItemWithTitle_action_keyEquivalent_("", None, "")
+            self.status.setEnabled_(False)
+            self.toggle = menu.addItemWithTitle_action_keyEquivalent_("", "toggle:", key)
+            self.toggle.setKeyEquivalentModifierMask_(mask)
+            self.toggle.setTarget_(self)
+            menu.addItem_(NSMenuItem.separatorItem())
+            for title, sel in (("Recalibrate…", "recalibrate:"), ("Show Log", "showLog:")):
+                menu.addItemWithTitle_action_keyEquivalent_(title, sel, "").setTarget_(self)
+            menu.addItem_(NSMenuItem.separatorItem())
+            menu.addItemWithTitle_action_keyEquivalent_(
+                "Quit HeadFocus (until next login)", "quit:", "").setTarget_(self)
+            self.item.setMenu_(menu)
+            self.refresh()
+
+        def refresh(self):
+            on = bool(tracker.enabled) if tracker.enabled is not None else is_on()
+            img = NSImage.imageWithSystemSymbolName_accessibilityDescription_(
+                "eye" if on else "eye.slash", "HeadFocus " + ("on" if on else "off"))
+            if img is not None:
+                img.setTemplate_(True)
+                self.item.button().setImage_(img)
+            else:
+                self.item.button().setTitle_("HF" if on else "hf")
+            self.item.button().setToolTip_(f"HeadFocus is {'on' if on else 'off'} ({hotkey_label(hotkey)})")
+            if on and tracker.current is not None:
+                self.status.setTitle_(f"HeadFocus on · facing {tracker.name(tracker.current)}")
+            else:
+                self.status.setTitle_("HeadFocus on" if on else "HeadFocus off (camera off)")
+            self.toggle.setTitle_("Turn Off" if on else "Turn On")
+
+        def toggle_(self, sender):
+            on = not is_on()
+            set_on(on)
+            NSSound.soundNamed_("Tink" if on else "Pop").play()
+
+        def recalibrate_(self, sender):
+            NSWorkspace.sharedWorkspace().openURL_(
+                NSURL.fileURLWithPath_(os.path.join(HERE, "Calibrate.command")))
+
+        def showLog_(self, sender):
+            NSWorkspace.sharedWorkspace().openURL_(
+                NSURL.fileURLWithPath_(os.path.join(HERE, "headfocus.log")))
+
+        def quit_(self, sender):
+            log("Quit from menu bar.")
+            tracker.stop = True
+            os._exit(0)  # clean exit: the login agent won't restart it until next login
+
+    app = NSApplication.sharedApplication()
+    app.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
+    ctl = Controller.alloc().init()
+    ctl.setup()
+    tracker.ui = ctl
+    tracker.on_change = lambda: AppHelper.callAfter(ctl.refresh)
+
+    def on_key(event):
+        mods = event.modifierFlags() & NSEventModifierFlagDeviceIndependentFlagsMask
+        chars = (event.charactersIgnoringModifiers() or "").lower()
+        if chars == key and mods & mask == mask and mods & ~mask & 0x1E0000 == 0:
+            ctl.toggle_(None)
+    monitor = NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(NSEventMaskKeyDown, on_key)
+
+    import threading
+    threading.Thread(target=tracker.run, daemon=True).start()
+    AppHelper.runEventLoop(installInterrupt=True)
+    del monitor
 
 
 def cmd_run(args):
@@ -337,86 +581,33 @@ def cmd_run(args):
         sys.exit(1)  # non-zero so the login agent retries after permission is granted
     cfg = json.load(open(CONFIG))
     displays = get_displays()
-    # Match calibrated displays by ID, falling back to name (macOS can give a
-    # monitor a new ID after it sleeps or is reconnected).
-    by_id = {d["id"]: i for i, d in enumerate(displays)}
-    by_name = {d["name"]: i for i, d in enumerate(displays)}
-    centers = []
-    for c in cfg["displays"]:
-        i = by_id.get(c["id"], by_name.get(c["name"]))
-        if i is not None and i not in [x[0] for x in centers]:
-            centers.append((i, np.array([c["yaw"], c["pitch"]]), c["name"]))
+    centers = load_centers(cfg, displays)
     if len(centers) < 2:
         sys.exit("Display setup changed since calibration. Run: ./headfocus calibrate")
 
-    # Optional tuning in config.json (lets the login agent be tuned without new flags).
-    args.dwell = cfg.get("dwell", args.dwell)
-    args.margin = cfg.get("margin", args.margin)
-    max_dist = cfg.get("max_dist", 22.0)  # farther than this from every display = looking away
-    debug = cfg.get("debug", False)
-    next_trace = 0.0
+    tracker = Tracker(args, cfg, displays, centers)
+    if args.preview or args.no_menubar:
+        # The preview window needs the main thread, so no menu bar here.
+        try:
+            tracker.run()
+        except KeyboardInterrupt:
+            print("\nStopped.")
+    else:
+        run_menubar(tracker, cfg.get("hotkey", HOTKEY))
 
-    pose = HeadPose(cfg.get("camera", args.camera), preview=args.preview)
-    smoothed = None
-    current = None        # display we last decided you're looking at
-    candidate, since = None, 0.0
-    alpha = 0.5           # smoothing (higher = more responsive)
-    period = 1.0 / args.fps
 
-    names = ", ".join(f"[{i}] {n}" for i, _, n in centers)
-    log(f"Tracking {names}. dwell {args.dwell:.2f}s, margin {args.margin:.1f} deg.")
-    layout = [d["id"] for d in displays]
-    next_layout_check = time.monotonic() + 5
-    try:
-        while True:
-            t = time.monotonic()
-            if t >= next_layout_check:
-                next_layout_check = t + 5
-                if [d["id"] for d in get_displays()] != layout:
-                    # Monitor plugged/unplugged: exit so the login agent restarts us
-                    # with the new layout.
-                    print("Display layout changed, restarting.")
-                    sys.exit(3)
-            p = pose.read(label=centers[[c[0] for c in centers].index(current)][2]
-                          if current is not None else "")
-            if debug and t >= next_trace:
-                next_trace = t + 0.5
-                log("pose " + (f"yaw {p[0]:+6.1f} pitch {p[1]:+6.1f}" if p else "no face")
-                    + (f"  smoothed {smoothed[0]:+6.1f} {smoothed[1]:+6.1f}" if smoothed is not None else "")
-                    + f"  current {current}")
-            if p is None:
-                candidate = None
-            else:
-                v = np.array(p)
-                smoothed = v if smoothed is None else alpha * v + (1 - alpha) * smoothed
-                dists = {i: float(np.linalg.norm(smoothed - c)) for i, c, _ in centers}
-                nearest = min(dists, key=dists.get)
+def cmd_on(_args):
+    set_on(True)
+    print("HeadFocus on.")
 
-                # Looking away (phone, window, person): don't switch.
-                if dists[nearest] > max_dist:
-                    candidate = None
-                # Hysteresis: only consider a switch when clearly closer to another display.
-                elif current is None or (nearest != current and
-                                       dists[current] - dists[nearest] > args.margin):
-                    if candidate != nearest:
-                        candidate, since = nearest, t
-                    elif t - since >= args.dwell:
-                        first = current is None
-                        current, candidate = nearest, None
-                        log(f"facing [{current}] yaw {smoothed[0]:+.1f} pitch {smoothed[1]:+.1f}"
-                            + (" (startup, no focus change)" if first else ""))
-                        if not first:  # don't steal focus at startup
-                            on_switch(displays, current, args)
-                else:
-                    candidate = None
 
-            dt = time.monotonic() - t
-            if dt < period:
-                time.sleep(period - dt)
-    except KeyboardInterrupt:
-        print("\nStopped.")
-    finally:
-        pose.close()
+def cmd_off(_args):
+    set_on(False)
+    print("HeadFocus off (camera released).")
+
+
+def cmd_toggle(args):
+    (cmd_off if is_on() else cmd_on)(args)
 
 
 def log(msg):
@@ -457,8 +648,12 @@ def main():
     r.add_argument("--fps", type=float, default=15.0)
     r.add_argument("--move-cursor", action="store_true",
                    help="also move the mouse to the focused window")
+    r.add_argument("--no-menubar", action="store_true", help="don't show the menu bar icon")
     r.add_argument("-q", "--quiet", dest="verbose", action="store_false")
     r.set_defaults(func=cmd_run)
+
+    for name, fn in (("on", cmd_on), ("off", cmd_off), ("toggle", cmd_toggle)):
+        sub.add_parser(name).set_defaults(func=fn)
 
     d = sub.add_parser("displays")
     d.set_defaults(func=cmd_displays)

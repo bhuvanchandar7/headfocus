@@ -47,6 +47,11 @@ EOF
   restart) launchctl kickstart -k "$DOMAIN/$LABEL" ;;
   status)  if loaded; then launchctl print "$DOMAIN/$LABEL" | grep -E "state =|pid =|last exit" | head -3; else echo "not running"; fi ;;
   log)     tail -n 30 -f "$DIR/headfocus.log" ;;
+  on|off|toggle)
+    "$DIR/.venv/bin/python" "$DIR/headfocus.py" "$1"
+    # "on" also starts the background copy if it was quit from the menu bar.
+    [[ "$1" != off && -f "$PLIST" ]] && ! loaded && launchctl bootstrap "$DOMAIN" "$PLIST"
+    true ;;
   calibrate)
     "$DIR/.venv/bin/python" "$DIR/headfocus.py" "$@" || exit
     loaded && launchctl kickstart -k "$DOMAIN/$LABEL" && echo "Restarted the background copy with the new calibration." ;;

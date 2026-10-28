@@ -9,6 +9,7 @@ No clicking, no moving the mouse. The cursor is left alone.
 - Runs fully on your Mac. No video is saved or sent anywhere.
 - Ignores quick glances and turns away from your screens (phone, people in the room).
 - Leaves you alone otherwise: Cmd+Tab and clicking work as usual.
+- Easy to switch off: click the eye in the menu bar, or press **⌃⌥⌘H** (Control+Option+Command+H).
 
 ## Install
 
@@ -54,13 +55,29 @@ macOS treats HeadFocus as its own app, so it asks once more for **Camera** and
 **Accessibility** for "HeadFocus". The settings page opens for you. After you allow
 both, it starts within 30 seconds.
 
+## Turning it on and off
+
+- **Menu bar:** click the eye icon and choose **Turn Off** / **Turn On**. The icon shows an eye
+  when on and a crossed-out eye when off. The menu also shows which display you're facing,
+  and has Recalibrate, Show Log, and Quit.
+- **Keyboard:** press **⌃⌥⌘H** anywhere to toggle. You'll hear a short sound.
+- **Terminal:** `./headfocus on`, `./headfocus off`, or `./headfocus toggle`.
+
+When off, the camera is released, so the webcam light goes out. It stays off (even after
+a restart) until you turn it back on. **Quit** from the menu stops it until your next login;
+`./headfocus on` starts it again.
+
+To use a different shortcut, add for example `"hotkey": "ctrl+opt+h"` to `config.json`
+and run `./headfocus restart`. Modifiers: `ctrl`, `opt`, `cmd`, `shift`.
+
 ## Commands
 
 | Command | What it does |
 |---|---|
 | `./headfocus status` | Is the background copy running? |
 | `./headfocus log` | Watch which display it thinks you're facing |
-| `./headfocus stop` / `start` | Pause until next login / resume |
+| `./headfocus on` / `off` / `toggle` | Turn tracking on or off (off releases the camera) |
+| `./headfocus stop` / `start` | Stop the background copy until next login / start it |
 | `./headfocus calibrate` | Recalibrate (after moving your chair, laptop, or camera) |
 | `./headfocus uninstall` | Stop running at login |
 | `./headfocus displays` | List displays and the top window on each |
@@ -75,10 +92,12 @@ Add any of these to `config.json` (created by calibration), then `./headfocus re
 | `"dwell"` | `0.3` | quick glances switch windows (seconds you must face a display) |
 | `"margin"` | `3.0` | it flips back and forth between displays (degrees) |
 | `"max_dist"` | `22.0` | turning slightly past a display doesn't count as facing it (degrees) |
+| `"hotkey"` | `"ctrl+opt+cmd+h"` | another app uses the same shortcut |
 | `"debug"` | `false` | set `true` to log your head angle twice a second |
 
 When running in the foreground you can also pass `--dwell`, `--margin`, `--camera N`
-(pick another camera) and `--move-cursor` (also move the mouse to the focused window).
+(pick another camera), `--move-cursor` (also move the mouse to the focused window)
+and `--no-menubar`.
 
 ## How it works
 
@@ -98,7 +117,7 @@ instead of to Python itself.
 ## Limitations
 
 - It tracks your head, not your eyes. Glancing at another screen with only your eyes won't switch.
-- The webcam light stays on while it runs.
+- The webcam light stays on while it's on. Turn it off when you don't need it.
 - It activates the window. Which text box gets the cursor is up to the app (most restore the last one).
 - Recalibrate if you rearrange your displays or move the camera.
 - If you move this folder, run `./setup.sh` and `./headfocus install` again.

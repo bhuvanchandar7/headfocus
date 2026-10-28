@@ -6,3 +6,4 @@ headfocus.log
 *.plist.generated
 .DS_Store
 .build/
+.off
